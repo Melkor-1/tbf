@@ -1,15 +1,20 @@
 /*
- * LOC: 750. (*.c, *.h)
- *
- * TODO: REPL? Perhaps?
- *       CLI flags customization?
- *       Native code with QBE?
+ * LOC: 848. (*.c, *.h)
  */
+
+#undef _POSIX_C_SOURCE
+#undef _XOPEN_SOURCE
+
+#define _POSIX_C_SOURCE 200819L
+#define _XOPEN_SOURCE   700
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <stdarg.h>
+
+#include <getopt.h>
 
 #include "tbf_util.h"
 
@@ -17,11 +22,20 @@
     #error "This program uses ISO C99. Get a better compiler."
 #endif
 
+#define INITIAL_TAPE_COUNT      8 * 1024
+#define INITIAL_STACK_COUNT     1 * 1024
+#define INITIAL_OP_COUNT        8 * 1024
+
+/* *INDENT-OFF* */
 typedef enum {
     BF_OK,
     BF_OUT_OF_MEMORY,
     BF_UNBALANCED_LOOP,
     BF_LOOP_END_BEFORE_START,
+    BF_CELL_VAL_OVERFLOW,
+    BF_CELL_VAL_UNDERFLOW,
+    BF_CELL_PTR_OVERFLOW,
+    BF_CELL_PTR_UNDERFLOW,
     BF_READ_FAILED,
     BF_WRITE_FAILED,
 } Bf_Codes;
@@ -30,11 +44,15 @@ static const char *const error_msgs[] = {
     /* See: [Byte Positions Are Better Than Line
      * Numbers](https::/www.computerenhance.com/p/byte-positions-are-better-than-line)
      */
-    [BF_UNBALANCED_LOOP]       = "%s[%zu]: error: unbalanced loop instruction '['.\n",
-    [BF_LOOP_END_BEFORE_START] = "%s[%zu]: error: trailing loop instruction ']'.\n",
-    [BF_OUT_OF_MEMORY]         = "%s: error: out of memory.\n",
-    [BF_READ_FAILED]           = "%s: error: a read operation failed: %s.\n",
-    [BF_WRITE_FAILED]          = "%s: error: a write operation failed: %s.\n",
+    [BF_UNBALANCED_LOOP]           = "%s[%zu]: error: unbalanced loop instruction '['.\n",
+    [BF_LOOP_END_BEFORE_START]     = "%s[%zu]: error: trailing loop instruction ']'.\n",
+    [BF_CELL_VAL_OVERFLOW]         = "%s: error: cell value overflowed.\n",
+    [BF_CELL_VAL_UNDERFLOW]        = "%s: error: cell value underflowed.\n",
+    [BF_CELL_PTR_OVERFLOW]         = "%s: error: cell pointer underflowed.\n",
+    [BF_CELL_PTR_UNDERFLOW]        = "%s: error: cell pointer overflowed.\n",
+    [BF_OUT_OF_MEMORY]             = "%s: error: out of memory.\n",
+    [BF_READ_FAILED]               = "%s: error: a read operation failed: %s.\n",
+    [BF_WRITE_FAILED]              = "%s: error: a write operation failed: %s.\n",
 };
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -42,6 +60,7 @@ static const char *const error_msgs[] = {
         BF_WRITE_FAILED + 1, "Bf_Codes and error_msgs must kept be in sync!");
 #endif
 
+/* For the transpiler. */
 typedef enum {
     C_NONE,
     C_CLEAR,
@@ -91,12 +110,118 @@ typedef struct {
     size_t capacity;
 } Mem_Tape;
 
-#define ANSI_COLOR_RED      "\x1b[31m"
-#define ANSI_COLOR_RESET    "\x1b[0m"
+typedef enum {
+    BF_END_ERROR = 'e',
+    BF_END_WRAP  = 'w'
+} Ov_Behavior;
 
-static const char *pretty_print(bool color)
+/* *INDENT-ON* */
+
+typedef struct {
+    FILE *output;               /* Output C source to FILE. Required with tflag. */
+    Ov_Behavior vflag;          /* Cell value overflow behavior. */
+    Ov_Behavior cflag;          /* Cell pointer overflow behavior. */
+    bool tflag;                 /* Transpile to C. */
+    bool pflag;                 /* Print colorful error messages. */
+} flags;
+
+#define OPSTRING    "v:c:tpo:h"
+
+// There's a disrepancy between the transpiler and the interpreter in that the
+// optimizations aren't done for the interpreter.
+static void help(void)
 {
-    return color ? ANSI_COLOR_RED "%s" ANSI_COLOR_RESET "\n" : "%s";
+    puts("Usage: tbf [OPTIONS] SRC\n\n"
+        "  The uncompromising brainfuck interpreter.\n\n"
+        "Options:\n"
+        "    -v      value overflow/underflow behavior\n"
+        "    -c      cell pointer overflow/underflow behavior\n"
+        "    -t      skip interpretation and transpile to C\n"
+        "    -p      print colorful error messages\n"
+        "    -o      output C source file name (required with -t)\n"
+        "    -h      this help message\n"
+        "\n"
+        "Overflow/Underflow behaviours can be one of:\n"
+        "  e    throw an error and quit upon overflow/underflow\n"
+        "  w    wrap-around to other end upon overflow/underflow (default)\n"
+        "\n"
+        "Note:\n"
+        "    The -p flag assumes that the terminal supports ANSI escape\n"
+        "    sequences.\n");
+    exit(EXIT_SUCCESS);
+}
+
+static void err_and_exit(void)
+{
+    fprintf(stderr, "The syntax of the command is incorrect.\n"
+        "Try tbf -h for more information.\n");
+    exit(EXIT_FAILURE);
+}
+
+/* *INDENT-OFF* */
+static void parse_options(int           argc,
+                          char *        argv[static argc], 
+                          const char    opstring[static 1], 
+                          flags         opt_ptr[static 1])
+/* *INDENT-ON* */
+
+{
+    int c = 0;
+
+    while ((c = getopt(argc, argv, opstring)) != -1) {
+        switch (c) {
+            case 'v':
+            case 'c': {
+                int arg = optarg[0];
+
+                if (arg != BF_END_WRAP && arg != BF_END_ERROR) {
+                    fprintf(stderr, "Error: invalid argument for -%c.\n", c);
+                    err_and_exit();
+                }
+
+                *(c == 'v' ? &opt_ptr->vflag : &opt_ptr->cflag) = arg;
+            } break;
+
+            case 't':
+                opt_ptr->tflag = true;
+                break;
+
+            case 'o':
+                /* Multiple -o flags? Which one to use? Not checking this would 
+                 * cause a resource leak. 
+                 */
+                if (opt_ptr->output != stdout) {
+                    fprintf(stderr, "Error: multiple -o flags provided.\n");
+                    err_and_exit();
+                }
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+                opt_ptr->output = tbf_xfopen(optarg, "wbx");
+#else
+                opt_ptr->output = tbf_xfopen(optarg, "wb");
+#endif
+
+                break;
+
+            case 'p':
+                opt_ptr->pflag = true;
+                break;
+
+            case 'h':
+                help();
+                /* FALLTHROUGH */
+
+                /* case '?' */
+            default:
+                err_and_exit();
+        }
+    }
+
+    /* If -o was provided without -t: */
+    if (opt_ptr->output != stdout && !opt_ptr->tflag) {
+        fprintf(stderr, "Error: -o provided without -t.\n");
+        err_and_exit();
+    }
 }
 
 static C_Op_Kind check_is_sub(size_t ip, Ops ops[static 1])
@@ -112,7 +237,7 @@ static C_Op_Kind check_is_sub(size_t ip, Ops ops[static 1])
      * cleared .It further increments the head pointer by 1.
      *
      */
-    if (ops->items[ip + 1].kind == OP_PREV 
+    if (ops->items[ip + 1].kind == OP_PREV
         && ops->items[ip + 1].operand == 1
         && ops->items[ip + 2].kind == OP_DEC
         && ops->items[ip + 3].kind == OP_NEXT
@@ -122,7 +247,7 @@ static C_Op_Kind check_is_sub(size_t ip, Ops ops[static 1])
         && ops->items[ip + 5].kind == OP_LOOP_END) {
         return C_SUB_TYPE1;
     }
-    
+
     /* Check `[>-<-]` pattern.
      *
      * This sets the second cell to the difference of the first and second cells.
@@ -144,14 +269,14 @@ static C_Op_Kind check_is_sub(size_t ip, Ops ops[static 1])
 
 }
 
-static C_Op_Kind check_is_clear(size_t ip, Ops ops[static 1]) 
+static C_Op_Kind check_is_clear(size_t ip, Ops ops[static 1])
 {
     if ((ip + 2) < ip || ip + 2 > ops->count) {
         return C_NONE;
     }
-    
+
     /* Check both `[-]` and `[+]`. As the values wrap-around on overflow, the 
-     * second one would stop looping when the currend cell becomes zero. 
+     * second one would stop looping when the current cell becomes zero. 
      */
     if ((ops->items[ip + 1].kind == OP_DEC || ops->items[ip + 1].kind == OP_INC)
         && ops->items[ip + 1].operand == 1
@@ -177,7 +302,7 @@ static C_Op_Kind check_is_add_or_mul(size_t ip, Ops ops[static 1])
      * cleared .It further increments the head pointer by 1.
      *
      */
-    if (ops->items[ip + 1].kind == OP_PREV 
+    if (ops->items[ip + 1].kind == OP_PREV
         && ops->items[ip + 1].operand == 1
         && ops->items[ip + 2].kind == OP_INC
         && ops->items[ip + 3].kind == OP_NEXT
@@ -187,7 +312,7 @@ static C_Op_Kind check_is_add_or_mul(size_t ip, Ops ops[static 1])
         && ops->items[ip + 5].kind == OP_LOOP_END) {
         return C_ADD_OR_MUL_TYPE1;
     }
-    
+
     /* Check `[>++++<-]` pattern.
      *
      * This sets the second cell to the product of the first and second cells.
@@ -211,19 +336,13 @@ static C_Op_Kind check_is_add_or_mul(size_t ip, Ops ops[static 1])
 static inline bool append_op(Ops ops[static 1], Op item)
 {
     return tbf_grow_array_and_append((void **) &ops->items, &ops->capacity,
-        &ops->count, sizeof ops->items[0], &item);
+        &ops->count, sizeof ops->items[0], &item, INITIAL_OP_COUNT);
 }
 
 static inline bool push_addr_stack(Addr_Stack s[static 1], size_t item)
 {
-    return tbf_grow_array_and_append((void **) &s->items, &s->capacity, &s->count,
-        sizeof s->items[0], &item);
-}
-
-static inline bool append_tape(Mem_Tape tape[static 1], unsigned char item)
-{
-    return tbf_grow_array_and_append((void **) &tape->items, &tape->capacity,
-        &tape->count, sizeof tape->items[0], &item);
+    return tbf_grow_array_and_append((void **) &s->items, &s->capacity,
+        &s->count, sizeof s->items[0], &item, INITIAL_STACK_COUNT);
 }
 
 static inline size_t pop_addr_stack(Addr_Stack s[static 1])
@@ -234,12 +353,16 @@ static inline size_t pop_addr_stack(Addr_Stack s[static 1])
     return s->items[--s->count];
 }
 
-static bool transpile(Ops ops[static 1])
+static inline bool append_tape(Mem_Tape tape[static 1], unsigned char item)
 {
-    /* Perhaps all of this could go into a buffer before being dumped to a 
-     * FILE. 
-     */
-    puts("/*\n"
+    return tbf_grow_array_and_append((void **) &tape->items, &tape->capacity,
+        &tape->count, sizeof tape->items[0], &item, INITIAL_TAPE_COUNT);
+}
+
+static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
+{
+    tbf_xfprintf(options->output, 
+        "/*\n"
         " * XXX: This translation unit was automatically generated with\n"
         " *      tbf - The One Brainfuck Interpreter to Rule Them All.\n"
         " *      @Melkor-1\n"
@@ -248,7 +371,13 @@ static bool transpile(Ops ops[static 1])
         "#include <stdio.h>\n"
         "#include <stdlib.h>\n"
         "#include <string.h>\n"
+        "#include <stdint.h>\n"
         "#include <errno.h>\n"
+        "\n"
+        "typedef enum {\n"
+        "    BF_END_ERROR,\n"
+        "    BF_END_WRAP \n"
+        "} Ov_Behavior;\n"
         "\n"
         "#define INITIAL_TAPE_SIZE 30000\n"
         "#define GROW_CAPACITY(capacity, initial) \\\n"
@@ -261,7 +390,7 @@ static bool transpile(Ops ops[static 1])
         "    size_t capacity;\n"
         "} Mem_Tape;\n"
         "\n"
-        "static void grow_tape_and_append(Mem_Tape *t, unsigned char item)\n"
+        "static void grow_tape_and_append(Mem_Tape t[static 1], unsigned char item)\n"
         "{\n"
         "    if (t->count >= t->capacity) {\n"
         "        t->capacity = GROW_CAPACITY(t->capacity, INITIAL_TAPE_SIZE);\n"
@@ -277,6 +406,59 @@ static bool transpile(Ops ops[static 1])
         "    t->count += 1;\n"
         "}\n"
         "\n"
+        "static void grow_tape_and_append_many_zeroes(Mem_Tape t[static 1])\n"
+        "{\n"
+        "    while (t->head >= t->count) {\n"
+        "        grow_tape_and_append(t, 0);\n"
+        "    }\n"
+        "}\n"
+        "static void dec_cell_val(Ov_Behavior ob, Mem_Tape t[static 1], unsigned char subtrahend)\n"
+        "{\n"
+        "    if (ob == BF_END_ERROR) {\n"
+        "        if (t->mem[t->head] < subtrahend) {\n"
+        "            fprintf(stderr, \"Error: cell value underflow.\\n\");\n"
+        "                exit(EXIT_FAILURE);\n"
+        "        }\n"
+        "    }\n"
+        "    t->mem[t->head] -= subtrahend;\n"
+        "}\n"
+        "\n"
+        "static void inc_cell_val(Ov_Behavior ob, Mem_Tape t[static 1], unsigned char addend)\n"
+        "{\n"
+        "    if (ob == BF_END_ERROR) {\n"
+        "        if (t->mem[t->head] + addend < t->mem[t->head]) {\n"
+        "            fprintf(stderr, \"Error: cell value overflow.\\n\");\n"
+        "            exit(EXIT_FAILURE);\n"
+        "        }\n"
+        "    }\n"
+        "    t->mem[t->head] += addend;\n"
+        "}\n"
+        "\n"
+        "static void inc_cell_ptr(Ov_Behavior ob, Mem_Tape t[static 1], unsigned char addend)\n"
+        "{\n"
+        "    if (ob == BF_END_ERROR) {\n"
+        "        if (t->head + addend < t->head) {\n"
+        "            fprintf(stderr, \"Error: cell pointer overflow.\\n\");\n"
+        "            exit(EXIT_FAILURE);\n"
+        "        }\n"
+        "    }\n"
+        "    t->head += addend;\n"
+        "    grow_tape_and_append_many_zeroes(t);\n"
+        "}\n"
+        "\n"
+        "static void dec_cell_ptr(Ov_Behavior ob, Mem_Tape t[static 1], unsigned char subtrahend) \n"
+        "{\n"
+        "    if (ob == BF_END_ERROR) {\n"
+        "        if (t->head < subtrahend) {\n"
+        "            fprintf(stderr, \"Error: cell pointer underflow.\\n\");\n"
+        "            exit(EXIT_FAILURE);\n"
+        "        }\n"
+        "        t->head -= subtrahend;\n"
+        "        return;\n"
+        "    }\n"
+        "    t->head = t->head < subtrahend ? t->count - (subtrahend - t->head) : t->head - subtrahend;\n"
+        "}\n"
+        "\n"
         "static void xgetchar_many(Mem_Tape t[static 1], size_t ncycles)\n"
         "{\n"
         "    errno = 0;\n"
@@ -284,7 +466,7 @@ static bool transpile(Ops ops[static 1])
         "    for (size_t i = 0; i < ncycles; ++i) {\n"
         "        int c = 0;\n"
         "        if ((c = getchar()) == EOF) {\n"
-        "            fprintf(stderr, \"Error: A read operation failed: %s.\\n\",\n"
+        "            fprintf(stderr, \"Error: A read operation failed: %%s.\\n\",\n"
         "                errno ? strerror(errno) : \"unknown error\");\n"
         "            exit(EXIT_FAILURE);\n"
         "        }\n"
@@ -326,114 +508,121 @@ static bool transpile(Ops ops[static 1])
         "    fflush(stdout);\n"
         "}\n"
         "\n"
-        "static void grow_tape_and_append_many_zeroes(Mem_Tape t[static 1])\n"
-        "{\n"
-        "    while (t->head >= t->count) {\n"
-        "        grow_tape_and_append(t, 0);\n"
-        "    }\n"
-        "}\n"
-        "\n"
         "int main(void)\n"
-        "{\n" "    Mem_Tape t = {0};\n" "    grow_tape_and_append(&t, 0);\n");
+        "{\n" 
+        "    Mem_Tape t = {0};\n" 
+        "    grow_tape_and_append(&t, 0);\n"
+        "    Ov_Behavior cell_val_ob = %s;\n"
+        "    Ov_Behavior cell_ptr_ob = %s;\n",
+        options->vflag == BF_END_ERROR ? "BF_END_ERROR" : "BF_END_WRAP",
+        options->cflag == BF_END_ERROR ? "BF_END_ERROR" : "BF_END_WRAP");
 
-    Mem_Tape tape = { 0 };
     size_t ip = 0;
 
-    if (!append_tape(&tape, 0)) {
-        return BF_OUT_OF_MEMORY;
-    }
-    
     while (ip < ops->count) {
         Op op = ops->items[ip];
 
         switch (op.kind) {
-            case OP_INC: 
+            case OP_INC:
                 /* Exit on failure. Else we'd have to check 8 calls individually. */
-                tbf_xprintf("    t.mem[t.head] += %zu;\n", op.operand);
+                tbf_xfprintf(options->output, 
+                             "    inc_cell_val(cell_val_ob, &t, %zu);\n",
+                             op.operand);
                 ++ip;
                 break;
-            case OP_DEC: 
-                tbf_xprintf("    t.mem[t.head] -= %zu;\n", op.operand);
+
+            case OP_DEC:
+                tbf_xfprintf(options->output, 
+                             "    dec_cell_val(cell_val_ob, &t, %zu);\n",
+                             op.operand);
                 ++ip;
                 break;
-            case OP_PUT: 
-                tbf_xprintf("    xgenerate_buf_and_fwrite(%zu, t.mem[t.head]);\n",
-                            op.operand);
+                
+            case OP_PUT:
+                tbf_xfprintf(options->output,
+                    "    xgenerate_buf_and_fwrite(%zu, t.mem[t.head]);\n",
+                    op.operand);
                 ++ip;
                 break;
-            case OP_GET: 
-                tbf_xprintf("    xgetchar_many(&t, %zu);\n", op.operand);
+
+            case OP_GET:
+                tbf_xfprintf(options->output, "    xgetchar_many(&t, %zu);\n",
+                    op.operand);
                 ++ip;
                 break;
-            case OP_NEXT: 
-                tbf_xprintf("    t.head += %zu;\n\n"
-                            "    grow_tape_and_append_many_zeroes(&t);\n", op.operand);
+
+            case OP_NEXT:
+                tbf_xfprintf(options->output, 
+                             "   inc_cell_ptr(cell_ptr_ob, &t, %zu);\n",
+                             op.operand);
                 ++ip;
                 break;
-            case OP_PREV: 
-                tbf_xprintf("    t.head = t.head < %zu ? t.count - (%zu - t.head) : t.head - %zu;\n",
-                       op.operand, op.operand, op.operand);
+
+            case OP_PREV:
+                tbf_xfprintf(options->output, 
+                             "    dec_cell_ptr(cell_ptr_ob, &t, %zu);\n",
+                             op.operand);
                 ++ip;
                 break;
-            case OP_LOOP_START: 
+
+            case OP_LOOP_START: {
                 C_Op_Kind rv = 0;
 
                 if (rv = check_is_clear(ip, ops)) {
-                    tbf_xfputs("    t.mem[t.head] = 0;\n", stdout);
+                    tbf_xfputs("    t.mem[t.head] = 0;\n", options->output);
                     ip = op.operand;
                 } else if (rv = check_is_add_or_mul(ip, ops)) {
                     if (rv == C_ADD_OR_MUL_TYPE1) {
-                        tbf_xprintf("    t.head = t.head < 1 ? t.count - (1 - t.head) : t.head - 1;\n"
-                                    "    t.mem[t.head] += %zu * t.mem[t.head + 1];\n"
-                                    "    t.head += 1;\n"
-                                    "    grow_tape_and_append_many_zeroes(&t);\n"
-                                    "    t.mem[t.head] = 0;\n",
-                                    ops->items[ip + 2].operand);
+                        tbf_xfprintf(options->output,
+                                     "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                     "    inc_cell_val(cell_val_ob, &t, %zu * t.mem[t.head + 1]);\n"
+                                     "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                     "    t.mem[t.head] = 0;\n",
+                                     ops->items[ip + 2].operand);
+
                     } else {
-                        tbf_xprintf("    t.head += 1;\n"
-                                    "    grow_tape_and_append_many_zeroes(&t);\n"
-                                    "    t.mem[t.head] += t.mem[t.head - 1] * %zu;\n"
-                                    "    t.head -= 1;\n"
-                                    "    t.mem[t.head] = 0;\n",
-                                    ops->items[ip + 2].operand);
+                        tbf_xfprintf(options->output,
+                                     "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                     "    inc_cell_val(cell_val_ob, &t, %zu * t.mem[t.head - 1]);\n"
+                                     "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                     "    t.mem[t.head] = 0;\n",
+                                     ops->items[ip + 2].operand);
                     }
                     ip = op.operand;
                 } else if (rv = check_is_sub(ip, ops)) {
                     if (rv == C_SUB_TYPE1) {
-                        tbf_xprintf("    t.head = t.head < 1 ? t.count - (1 - t.head) : t.head - 1;\n"
-                                    "    t.mem[t.head] -= t.mem[t.head + 1];\n"
-                                    "    t.head += 1;\n"
-                                    "    grow_tape_and_append_many_zeroes(&t);\n"
-                                    "    t.mem[t.head] = 0;\n");
-                    } else {
-                        tbf_xprintf("    t.head += 1;\n"
-                                    "    grow_tape_and_append_many_zeroes(&t);\n"
-                                    "    t.mem[t.head] -= t.mem[t.head - 1];\n"
-                                    "    t.head -= 1;\n"
-                                    "    t.mem[t.head] = 0;\n",
-                                    ops->items[ip + 2].operand);
-                    }
+                        tbf_xfprintf(options->output,
+                                     "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                     "    dec_cell_val(cell_val_ob, &t, t.mem[t.head + 1]);\n"
+                                     "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                     "    t.mem[t.head] = 0;\n");
+                        } else {
+                            tbf_xfprintf(options->output,
+                                         "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                         "    dec_cell_val(cell_val_ob, &t, t.mem[t.head - 1]);\n"
+                                         "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                                         "    t.mem[t.head] = 0;\n");
+                        }
                     ip = op.operand;
                 } else {
-                    tbf_xfputs("    while (t.mem[t.head] != 0) {\n", stdout);
+                    tbf_xfputs("    while (t.mem[t.head] != 0) {\n",
+                        options->output);
                     ++ip;
                 }
-                break;
-            case OP_LOOP_END: 
-                tbf_xfputs("    }\n", stdout);
+            } break;
+
+            case OP_LOOP_END:
+                tbf_xfputs("    }\n", options->output);
                 ++ip;
                 break;
         }
     }
     tbf_xfputs("    free(t.mem);\n"
-               "    return EXIT_SUCCESS;\n"
-               "}\n",
-               stdout);
-    free(tape.items);
-    return true;
+        "    return EXIT_SUCCESS;\n" "}\n", options->output);
+    return BF_OK;
 }
 
-static Bf_Codes interpret(Ops ops[static 1])
+static Bf_Codes interpret(Ops ops[static 1], flags options[static 1])
 {
     Mem_Tape tape = { 0 };
 
@@ -441,7 +630,7 @@ static Bf_Codes interpret(Ops ops[static 1])
         return BF_OUT_OF_MEMORY;
     }
 
-    /* Should head be part of the Mem_Tape structure? */
+    /* Should head and ip be part of the Mem_Tape structure? */
     size_t head = 0;
     size_t ip = 0;
 
@@ -450,34 +639,55 @@ static Bf_Codes interpret(Ops ops[static 1])
 
         switch (op.kind) {
             case OP_INC:
+                if (options->vflag == BF_END_ERROR
+                    && (tape.items[head] + op.operand < tape.items[head])) {
+                    free(tape.items);
+                    return BF_CELL_VAL_OVERFLOW;
+                }
                 tape.items[head] += (unsigned char) op.operand;
                 ++ip;
                 break;
+
             case OP_DEC:
+                if (options->vflag == BF_END_ERROR
+                    && tape.items[head] < op.operand) {
+                    free(tape.items);
+                    return BF_CELL_VAL_UNDERFLOW;
+                }
                 tape.items[head] -= (unsigned char) op.operand;
                 ++ip;
                 break;
+
             case OP_GET:
                 for (size_t i = 0; i < op.operand; ++i) {
                     int c = getchar();
 
                     if (c == EOF) {
+                        free(tape.items);
                         return BF_READ_FAILED;
                     }
                     tape.items[head] = (unsigned char) c;
                 }
                 ++ip;
                 break;
+
             case OP_PUT:
                 for (size_t i = 0; i < op.operand; ++i) {
                     if (putchar(tape.items[head]) == EOF) {
+                        free(tape.items);
                         return BF_WRITE_FAILED;
                     }
                 }
                 fflush(stdout);
                 ++ip;
                 break;
+
             case OP_NEXT:
+                if ((options->cflag == BF_END_ERROR)
+                    && (head + op.operand < head)) {
+                    free(tape.items);
+                    return BF_CELL_PTR_OVERFLOW;
+                }
                 head += op.operand;
 
                 while (head >= tape.count) {
@@ -488,17 +698,25 @@ static Bf_Codes interpret(Ops ops[static 1])
                 }
                 ++ip;
                 break;
+                
             case OP_PREV:
-                /* Wrap-around on underflow. */
-                head =
-                    head <
-                    op.operand ? tape.count - (op.operand - head) : head -
-                    op.operand;
+                if (head < op.operand) {
+                    if (options->cflag == BF_END_ERROR) {
+                        free(tape.items);
+                        return BF_CELL_PTR_UNDERFLOW;
+                    }
+                    head = tape.count - (op.operand - head);
+                } else {
+                    head -= op.operand;
+                }
+
                 ++ip;
                 break;
+
             case OP_LOOP_START:
                 ip = tape.items[head] == 0 ? op.operand : ip + 1;
                 break;
+
             case OP_LOOP_END:
                 ip = tape.items[head] != 0 ? op.operand : ip + 1;
                 break;
@@ -508,9 +726,9 @@ static Bf_Codes interpret(Ops ops[static 1])
     return BF_OK;
 }
 
-static bool is_valid_token(int tok)
+static bool is_valid_bf_cmd(int cmd)
 {
-    static const unsigned char bf_toks[] = {
+    static const unsigned char bf_cmds[] = {
         OP_INC,
         OP_DEC,
         OP_GET,
@@ -521,22 +739,25 @@ static bool is_valid_token(int tok)
         OP_LOOP_END
     };
 
-    return memchr(bf_toks, tok, sizeof bf_toks) != nullptr;
+    return memchr(bf_cmds, cmd, sizeof bf_cmds) != nullptr;
 }
 
-static char get_next_lexeme(Lexer *l)
+static char get_next_lexeme(Lexer * l)
 {
-    while (l->pos < l->count && !is_valid_token(l->content[l->pos])) {
+    while (l->pos < l->count && !is_valid_bf_cmd(l->content[l->pos])) {
         ++l->pos;
     }
 
     return l->pos >= l->count ? 0 : l->content[l->pos++];
 }
 
+/* *INDENT-OFF* */
 static Bf_Codes generate_ops(size_t     nbytes,
                              const char code[static restrict nbytes],
                              Ops        ops[static restrict 1], 
                              size_t     byte_offset[static restrict 1])
+/* *INDENT-ON* */
+
 {
     Lexer l = {
         .content = code,
@@ -545,7 +766,7 @@ static Bf_Codes generate_ops(size_t     nbytes,
     };
 
     Addr_Stack stack = { 0 };
-    size_t last_op_loop_start = 0;
+    size_t prev_op_loop_start = 0;
     char lexeme = get_next_lexeme(&l);
 
     while (lexeme) {
@@ -555,7 +776,7 @@ static Bf_Codes generate_ops(size_t     nbytes,
             case OP_GET:
             case OP_PUT:
             case OP_NEXT:
-            case OP_PREV:{
+            case OP_PREV: {
                 size_t op_count = 1;
                 char next_lexeme = get_next_lexeme(&l);
 
@@ -564,29 +785,18 @@ static Bf_Codes generate_ops(size_t     nbytes,
                     next_lexeme = get_next_lexeme(&l);
                 }
 
-                Op op = {
-                    .kind = lexeme,
-                    .operand = op_count,
-                };
-
-                if (!append_op(ops, op)) {
+                if (!append_op(ops, (Op) {lexeme, op_count})) {
                     *byte_offset = l.pos;
                     return BF_OUT_OF_MEMORY;
                 }
 
                 lexeme = next_lexeme;
-            }
-                break;
+            } break;
 
-            case OP_LOOP_START:{
+            case OP_LOOP_START: {
                 size_t addr = ops->count;
 
-                Op op = {
-                    .kind = lexeme,
-                    .operand = 0,
-                };
-
-                if (!append_op(ops, op)) {
+                if (!append_op(ops, (Op) {lexeme, 0})) {
                     *byte_offset = l.pos;
                     return BF_OUT_OF_MEMORY;
                 }
@@ -595,25 +805,19 @@ static Bf_Codes generate_ops(size_t     nbytes,
                     *byte_offset = l.pos;
                     return BF_OUT_OF_MEMORY;
                 }
-                last_op_loop_start = l.pos;
+                prev_op_loop_start = l.pos;
                 lexeme = get_next_lexeme(&l);
-            }
-                break;
+            } break;
 
-            case OP_LOOP_END:{
+            case OP_LOOP_END: {
                 if (stack.count == 0) {
                     *byte_offset = l.pos;
                     return BF_LOOP_END_BEFORE_START;
                 }
-
+                
                 size_t addr = pop_addr_stack(&stack);
 
-                Op op = {
-                    .kind = lexeme,
-                    .operand = addr + 1,
-                };
-
-                if (!append_op(ops, op)) {
+                if (!append_op(ops, (Op) {lexeme, addr + 1})) {
                     *byte_offset = l.pos;
                     return BF_OUT_OF_MEMORY;
                 }
@@ -621,15 +825,14 @@ static Bf_Codes generate_ops(size_t     nbytes,
                 /* Backpatch. */
                 ops->items[addr].operand = ops->count;
                 lexeme = get_next_lexeme(&l);
-            }
-                break;
+            } break;
         }
     }
 
     free(stack.items);
 
     if (stack.count > 0) {
-        *byte_offset = last_op_loop_start;
+        *byte_offset = prev_op_loop_start;
         return BF_UNBALANCED_LOOP;
     }
     return BF_OK;
@@ -639,72 +842,90 @@ static Bf_Codes generate_ops(size_t     nbytes,
 static void disassemble_ops(Ops ops[static 1])
 {
     puts("== ops ==\n");
-    
+
     for (size_t i = 0; i < ops->count; ++i) {
         printf("%zu: %c (%zu)\n", i, ops->items[i].kind, ops->items[i].operand);
     }
 
     puts("== ops ==\n");
 }
-
 #endif                          /* NDEBUG */
 
 int main(int argc, char **argv)
 {
-    /* Sanity check. POSIX requires the invoking process to pass a non-null 
+    /* Sanity check. POSIX requires the invoking process to pass a non-null
      * argv[0].
      */
     if (!argv[0]) {
-        fputs("Error: A non-nullptr argv[0] was passed in through an "
-              "exec system call.\n", stderr);
+        fputs("A NULL argv[0] was passed in through an exex system call.\n",
+            stderr);
         return EXIT_FAILURE;
     }
 
-    if (argc != 2) {
-        fprintf(stderr, "Error: expected 2 arguments, received %d.\n"
-                "Usage: bf FILE.\n", argc);
-        return EXIT_FAILURE;
+    FILE *in_file = stdin;
+
+    /* *INDENT-OFF* */
+    flags options = {
+        .output   = stdout,
+        .vflag    = 0,
+        .cflag    = 0,
+        .tflag    = false,
+        .pflag    = false
+    };
+    /* *INDENT-ON* */
+
+    parse_options(argc, argv, OPSTRING, &options);
+
+    if ((optind + 1) == argc) {
+        in_file = tbf_xfopen(argv[optind], "rb");
+    } else if (optind > argc || argv[optind + 1] != nullptr) {
+        err_and_exit();
     }
 
-    FILE *const input = tbf_xfopen(argv[1], "rb");
+    const char *const in_fname = argv[optind];
+
     size_t nbytes = 0;
-    char *const src = tbf_xread_file(argv[1], input, &nbytes);
+    char *const src = tbf_xread_file(in_fname, in_file, &nbytes);
 
     Ops ops = { 0 };
     size_t byte_offset = 0;
     Bf_Codes rc = generate_ops(nbytes, src, &ops, &byte_offset);
-
+    int status = EXIT_FAILURE;
     free(src);
 
     if (rc != BF_OK) {
         switch (rc) {
-            case BF_READ_FAILED: case BF_WRITE_FAILED:
-                fprintf(stderr, error_msgs[rc], argv[1],
-                        errno ? strerror(errno) : "unexpected error");
+            case BF_READ_FAILED:
+            case BF_WRITE_FAILED:
+                colored_fprintf(options.pflag, stderr, error_msgs[rc], in_fname,
+                    errno ? strerror(errno) : "unexpected error");
                 break;
 
             case BF_OUT_OF_MEMORY:
-                fprintf(stderr, error_msgs[rc], argv[1]);
+                colored_fprintf(options.pflag, stderr, error_msgs[rc],
+                    in_fname);
                 break;
 
-            case BF_UNBALANCED_LOOP: case BF_LOOP_END_BEFORE_START:
-                fprintf(stderr, error_msgs[rc], argv[1], byte_offset);
+            case BF_UNBALANCED_LOOP:
+            case BF_LOOP_END_BEFORE_START:
+                colored_fprintf(options.pflag, stderr, error_msgs[rc], in_fname,
+                    byte_offset);
                 break;
         }
-        fclose(input);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 #ifdef NDEBUG
     disassemble_ops(&ops);
 #endif
-    rc = interpret(&ops);
+    rc = (options.tflag ? transpile : interpret) (&ops, &options);
 
     if (rc != BF_OK) {
-        fprintf(stderr, error_msgs[rc], argv[1]);
+        colored_fprintf(options.pflag, stderr, error_msgs[rc], in_fname);
     }
+    status = EXIT_SUCCESS;
 
-    transpile(&ops);
+  cleanup:
     free(ops.items);
-    fclose(input);
-    return EXIT_SUCCESS;
+    fclose(in_file);
+    return status;
 }
