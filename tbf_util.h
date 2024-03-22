@@ -13,15 +13,18 @@
 
 #if defined(__GNUC__) || defined(__clang__) || defined(__INTEL_LLVM_COMPILER)
     #define ATTRIB_PRINTF(...)      __attribute__((format (printf, __VA_ARGS__)))
+    #define ATTRIB_MALLOC(...)      __attribute__((malloc, malloc (__VA_ARGS__)))
 #else
     #define ATTRIB_PRINTF(...)      /**/
+    #define ATTRIB_MALLOC(...)      /**/
 #endif 
 
 #include <stdint.h>
 #include <stdio.h>
 
 FILE *tbf_xfopen(const char path[restrict static 1],
-                 const char mode[restrict static 1]);
+                 const char mode[restrict static 1])
+    ATTRIB_MALLOC(fclose, 1);
 
 bool tbf_grow_array_and_append(void *restrict *     ptr,
                                size_t               capacity[restrict static 1],

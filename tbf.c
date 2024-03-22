@@ -1,5 +1,10 @@
 /*
- * LOC: 848. (*.c, *.h)
+ * LOC: 937. (*.c, *.h)
+ *
+ * TOOD: Add optimizations to the interpreter.
+ *       Get rot13.b to compile and run properly. Is there a bug that's being
+ *       exploited? The interpreter is correctly interpreting it. Is it some 
+ *       optimization that's causing a problem?
  */
 
 #undef _POSIX_C_SOURCE
@@ -22,7 +27,7 @@
     #error "This program uses ISO C99. Get a better compiler."
 #endif
 
-#define INITIAL_TAPE_COUNT      8 * 1024
+#define INITIAL_TAPE_COUNT      32 * 1024
 #define INITIAL_STACK_COUNT     1 * 1024
 #define INITIAL_OP_COUNT        8 * 1024
 
@@ -60,7 +65,6 @@ static const char *const error_msgs[] = {
         BF_WRITE_FAILED + 1, "Bf_Codes and error_msgs must kept be in sync!");
 #endif
 
-/* For the transpiler. */
 typedef enum {
     C_NONE,
     C_CLEAR,
@@ -176,6 +180,10 @@ static void parse_options(int           argc,
 
                 if (arg != BF_END_WRAP && arg != BF_END_ERROR) {
                     fprintf(stderr, "Error: invalid argument for -%c.\n", c);
+                    
+                    if (opt_ptr->output != stdout) {
+                        fclose(opt_ptr->output);
+                    }
                     err_and_exit();
                 }
 
@@ -192,15 +200,18 @@ static void parse_options(int           argc,
                  */
                 if (opt_ptr->output != stdout) {
                     fprintf(stderr, "Error: multiple -o flags provided.\n");
+                    fclose(opt_ptr->output);
                     err_and_exit();
                 }
-
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+                /* Fail if file already exists. */
                 opt_ptr->output = tbf_xfopen(optarg, "wbx");
 #else
+                /* Overwrite it for now. We could open it in append mode later
+                 * during transpilation.
+                 */
                 opt_ptr->output = tbf_xfopen(optarg, "wb");
 #endif
-
                 break;
 
             case 'p':
@@ -208,11 +219,19 @@ static void parse_options(int           argc,
                 break;
 
             case 'h':
+                if (opt_ptr->output != stdout) {
+                    fclose(opt_ptr->output);
+                }
+
                 help();
                 /* FALLTHROUGH */
 
                 /* case '?' */
             default:
+                if (opt_ptr->output != stdout) {
+                    fclose(opt_ptr->output);
+                }
+
                 err_and_exit();
         }
     }
@@ -220,6 +239,7 @@ static void parse_options(int           argc,
     /* If -o was provided without -t: */
     if (opt_ptr->output != stdout && !opt_ptr->tflag) {
         fprintf(stderr, "Error: -o provided without -t.\n");
+        fclose(opt_ptr->output);
         err_and_exit();
     }
 }
@@ -240,6 +260,7 @@ static C_Op_Kind check_is_sub(size_t ip, Ops ops[static 1])
     if (ops->items[ip + 1].kind == OP_PREV
         && ops->items[ip + 1].operand == 1
         && ops->items[ip + 2].kind == OP_DEC
+        && ops->items[ip + 2].operand == 1 
         && ops->items[ip + 3].kind == OP_NEXT
         && ops->items[ip + 3].operand == 1
         && ops->items[ip + 4].kind == OP_DEC
@@ -257,6 +278,7 @@ static C_Op_Kind check_is_sub(size_t ip, Ops ops[static 1])
     if (ops->items[ip + 1].kind == OP_NEXT
         && ops->items[ip + 1].operand == 1
         && ops->items[ip + 2].kind == OP_DEC
+        && ops->items[ip + 2].operand == 1
         && ops->items[ip + 3].kind == OP_PREV
         && ops->items[ip + 3].operand == 1
         && ops->items[ip + 4].kind == OP_DEC
@@ -361,7 +383,7 @@ static inline bool append_tape(Mem_Tape tape[static 1], unsigned char item)
 
 static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
 {
-    tbf_xfprintf(options->output, 
+    tbf_xfputs(
         "/*\n"
         " * XXX: This translation unit was automatically generated with\n"
         " *      tbf - The One Brainfuck Interpreter to Rule Them All.\n"
@@ -373,6 +395,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "#include <string.h>\n"
         "#include <stdint.h>\n"
         "#include <errno.h>\n"
+        "#include <limits.h>\n"
         "\n"
         "typedef enum {\n"
         "    BF_END_ERROR,\n"
@@ -411,6 +434,16 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "    while (t->head >= t->count) {\n"
         "        grow_tape_and_append(t, 0);\n"
         "    }\n"
+        "}\n"
+        "unsigned char chkd_mul(Ov_Behavior ov, unsigned char a, unsigned char b)\n"
+        "{\n"
+        "    if (ov) {\n"
+        "        if (a != 0 && b > UCHAR_MAX / a) {\n"
+        "            fprintf(stderr, \"Error: cell value overflow.\\n\");\n"
+        "            exit(EXIT_FAILURE);\n"
+        "        }\n"
+        "    }\n"
+        "    return a * b;\n"
         "}\n"
         "static void dec_cell_val(Ov_Behavior ob, Mem_Tape t[static 1], unsigned char subtrahend)\n"
         "{\n"
@@ -461,19 +494,26 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "\n"
         "static void xgetchar_many(Mem_Tape t[static 1], size_t ncycles)\n"
         "{\n"
+        "    clearerr(stdin);\n"
         "    errno = 0;\n"
         "\n"
         "    for (size_t i = 0; i < ncycles; ++i) {\n"
-        "        int c = 0;\n"
-        "        if ((c = getchar()) == EOF) {\n"
-        "            fprintf(stderr, \"Error: A read operation failed: %%s.\\n\",\n"
-        "                errno ? strerror(errno) : \"unknown error\");\n"
-        "            exit(EXIT_FAILURE);\n"
+        "        int c = getchar();\n"
+        "\n"
+        "        if (c == EOF) {\n"
+        "            if (ferror(stdin)) {\n"
+        "                fprintf(stderr, \"Error: A read operation failed: %s.\\n\",\n"
+        "                    errno ? strerror(errno) : \"unknown error\");\n"
+        "                exit(EXIT_FAILURE);\n"
+        "            }\n"
+        "        } else {\n"
+        "            t->mem[t->head] = (unsigned char) c;\n"
         "        }\n"
-        "        t->mem[t->head] = c;\n"
         "    }\n"
         "}\n"
-        "\n"
+        "\n", options->output);
+
+    tbf_xfprintf(options->output,
         "void xgenerate_buf_and_fwrite(size_t size, int c)\n"
         "{\n"
         "    if (size > 1) {\n"
@@ -509,8 +549,8 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "}\n"
         "\n"
         "int main(void)\n"
-        "{\n" 
-        "    Mem_Tape t = {0};\n" 
+        "{\n"
+        "    Mem_Tape t = {0};\n"
         "    grow_tape_and_append(&t, 0);\n"
         "    Ov_Behavior cell_val_ob = %s;\n"
         "    Ov_Behavior cell_ptr_ob = %s;\n",
@@ -525,19 +565,17 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         switch (op.kind) {
             case OP_INC:
                 /* Exit on failure. Else we'd have to check 8 calls individually. */
-                tbf_xfprintf(options->output, 
-                             "    inc_cell_val(cell_val_ob, &t, %zu);\n",
-                             op.operand);
+                tbf_xfprintf(options->output,
+                    "    inc_cell_val(cell_val_ob, &t, %zu);\n", op.operand);
                 ++ip;
                 break;
 
             case OP_DEC:
-                tbf_xfprintf(options->output, 
-                             "    dec_cell_val(cell_val_ob, &t, %zu);\n",
-                             op.operand);
+                tbf_xfprintf(options->output,
+                    "    dec_cell_val(cell_val_ob, &t, %zu);\n", op.operand);
                 ++ip;
                 break;
-                
+
             case OP_PUT:
                 tbf_xfprintf(options->output,
                     "    xgenerate_buf_and_fwrite(%zu, t.mem[t.head]);\n",
@@ -552,64 +590,68 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
                 break;
 
             case OP_NEXT:
-                tbf_xfprintf(options->output, 
-                             "   inc_cell_ptr(cell_ptr_ob, &t, %zu);\n",
-                             op.operand);
+                tbf_xfprintf(options->output,
+                    "   inc_cell_ptr(cell_ptr_ob, &t, %zu);\n", op.operand);
                 ++ip;
                 break;
 
             case OP_PREV:
-                tbf_xfprintf(options->output, 
-                             "    dec_cell_ptr(cell_ptr_ob, &t, %zu);\n",
-                             op.operand);
+                tbf_xfprintf(options->output,
+                    "    dec_cell_ptr(cell_ptr_ob, &t, %zu);\n", op.operand);
                 ++ip;
                 break;
 
-            case OP_LOOP_START: {
+            case OP_LOOP_START:{
                 C_Op_Kind rv = 0;
 
                 if (rv = check_is_clear(ip, ops)) {
-                    tbf_xfputs("    t.mem[t.head] = 0;\n", options->output);
+                    tbf_xfputs("    if (cell_val_ob == BF_END_ERROR) {\n"
+                               "        fprintf(stderr, \"Error: cell value overflowed\\n.\");\n"
+                               "        return EXIT_FAILURE;\n"
+                               "    }\n"
+                               "    t.mem[t.head] = 0;\n", 
+                               options->output);
                     ip = op.operand;
                 } else if (rv = check_is_add_or_mul(ip, ops)) {
                     if (rv == C_ADD_OR_MUL_TYPE1) {
                         tbf_xfprintf(options->output,
-                                     "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                     "    inc_cell_val(cell_val_ob, &t, %zu * t.mem[t.head + 1]);\n"
-                                     "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                     "    t.mem[t.head] = 0;\n",
-                                     ops->items[ip + 2].operand);
+                            "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    inc_cell_val(cell_val_ob, &t, chkd_mul(cell_val_ob, %zu, t.mem[t.head + 1]));\n"
+                            "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    t.mem[t.head] = 0;\n",
+                            ops->items[ip + 2].operand);
 
                     } else {
                         tbf_xfprintf(options->output,
-                                     "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                     "    inc_cell_val(cell_val_ob, &t, %zu * t.mem[t.head - 1]);\n"
-                                     "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                     "    t.mem[t.head] = 0;\n",
-                                     ops->items[ip + 2].operand);
+                            "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    inc_cell_val(cell_val_ob, &t, chkd_mul(cell_val_ob, %zu, t.mem[t.head - 1]));\n" 
+                            "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    t.mem[t.head] = 0;\n",
+                            ops->items[ip + 2].operand);
                     }
                     ip = op.operand;
                 } else if (rv = check_is_sub(ip, ops)) {
                     if (rv == C_SUB_TYPE1) {
                         tbf_xfprintf(options->output,
-                                     "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                     "    dec_cell_val(cell_val_ob, &t, t.mem[t.head + 1]);\n"
-                                     "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                     "    t.mem[t.head] = 0;\n");
-                        } else {
-                            tbf_xfprintf(options->output,
-                                         "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                         "    dec_cell_val(cell_val_ob, &t, t.mem[t.head - 1]);\n"
-                                         "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
-                                         "    t.mem[t.head] = 0;\n");
-                        }
+                            "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    dec_cell_val(cell_val_ob, &t, t.mem[t.head + 1]);\n"
+                            "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    t.mem[t.head] = 0;\n");
+                    } else {
+                        tbf_xfprintf(options->output,
+                            "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    dec_cell_val(cell_val_ob, &t, t.mem[t.head - 1]);\n"
+                            "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n"
+                            "    t.mem[t.head] = 0;\n");
+                    }
                     ip = op.operand;
                 } else {
                     tbf_xfputs("    while (t.mem[t.head] != 0) {\n",
                         options->output);
                     ++ip;
                 }
-            } break;
+            }
+                break;
 
             case OP_LOOP_END:
                 tbf_xfputs("    }\n", options->output);
@@ -659,14 +701,22 @@ static Bf_Codes interpret(Ops ops[static 1], flags options[static 1])
                 break;
 
             case OP_GET:
+                clearerr(stdin);
+
                 for (size_t i = 0; i < op.operand; ++i) {
                     int c = getchar();
 
+                    /* An argument for leaving the cell's value unchanged:
+                     * brainfuck.org/epistle.html
+                     */
                     if (c == EOF) {
-                        free(tape.items);
-                        return BF_READ_FAILED;
+                        if (ferror(stdin)) {
+                            free(tape.items);
+                            return BF_READ_FAILED;
+                        }
+                    } else {
+                        tape.items[head] = (unsigned char) c;
                     }
-                    tape.items[head] = (unsigned char) c;
                 }
                 ++ip;
                 break;
@@ -698,7 +748,7 @@ static Bf_Codes interpret(Ops ops[static 1], flags options[static 1])
                 }
                 ++ip;
                 break;
-                
+
             case OP_PREV:
                 if (head < op.operand) {
                     if (options->cflag == BF_END_ERROR) {
@@ -785,7 +835,7 @@ static Bf_Codes generate_ops(size_t     nbytes,
                     next_lexeme = get_next_lexeme(&l);
                 }
 
-                if (!append_op(ops, (Op) {lexeme, op_count})) {
+                if (!append_op(ops, (Op) { lexeme, op_count})) {
                     *byte_offset = l.pos;
                     return BF_OUT_OF_MEMORY;
                 }
@@ -796,7 +846,7 @@ static Bf_Codes generate_ops(size_t     nbytes,
             case OP_LOOP_START: {
                 size_t addr = ops->count;
 
-                if (!append_op(ops, (Op) {lexeme, 0})) {
+                if (!append_op(ops, (Op) { lexeme, 0})) {
                     *byte_offset = l.pos;
                     return BF_OUT_OF_MEMORY;
                 }
@@ -809,15 +859,15 @@ static Bf_Codes generate_ops(size_t     nbytes,
                 lexeme = get_next_lexeme(&l);
             } break;
 
-            case OP_LOOP_END: {
+            case OP_LOOP_END:{
                 if (stack.count == 0) {
                     *byte_offset = l.pos;
                     return BF_LOOP_END_BEFORE_START;
                 }
-                
+
                 size_t addr = pop_addr_stack(&stack);
 
-                if (!append_op(ops, (Op) {lexeme, addr + 1})) {
+                if (!append_op(ops, (Op) { lexeme, addr + 1})) {
                     *byte_offset = l.pos;
                     return BF_OUT_OF_MEMORY;
                 }
@@ -891,6 +941,7 @@ int main(int argc, char **argv)
     size_t byte_offset = 0;
     Bf_Codes rc = generate_ops(nbytes, src, &ops, &byte_offset);
     int status = EXIT_FAILURE;
+
     free(src);
 
     if (rc != BF_OK) {
@@ -927,5 +978,9 @@ int main(int argc, char **argv)
   cleanup:
     free(ops.items);
     fclose(in_file);
+    
+    if (options.output != stdout) {
+        fclose(options.output);
+    }
     return status;
 }
