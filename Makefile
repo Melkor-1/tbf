@@ -1,6 +1,6 @@
 CC:= gcc-13 
 
-CFLAGS += -std=c99
+CFLAGS += -std=c2x
 #CFLAGS += -DNDEBUG
 CFLAGS += -g3
 CFLAGS += -ggdb

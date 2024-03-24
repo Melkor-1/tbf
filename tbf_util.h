@@ -21,10 +21,11 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 FILE *tbf_xfopen(const char path[restrict static 1],
                  const char mode[restrict static 1])
-    ATTRIB_MALLOC(fclose, 1);
+                 ATTRIB_MALLOC(fclose, 1);
 
 bool tbf_grow_array_and_append(void *restrict *     ptr,
                                size_t               capacity[restrict static 1],
@@ -35,7 +36,8 @@ bool tbf_grow_array_and_append(void *restrict *     ptr,
 
 char *tbf_xread_file(const char path[restrict static 1],
                      FILE       stream[restrict static 1], 
-                     size_t     nbytes[restrict static 1]);
+                     size_t     nbytes[restrict static 1])
+                     ATTRIB_MALLOC(free, 1);
 
 int tbf_xfputs(const char s[static 1], FILE stream[static 1]);
 

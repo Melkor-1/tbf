@@ -1,10 +1,8 @@
 /*
- * LOC: 937. (*.c, *.h)
+ * LOC: 953. (*.c, *.h)
  *
- * TOOD: Add optimizations to the interpreter.
- *       Get rot13.b to compile and run properly. Is there a bug that's being
- *       exploited? The interpreter is correctly interpreting it. Is it some 
- *       optimization that's causing a problem?
+ * TOD0: Replicate the transpiler's optimizations in the interpreter.
+ *       Can we keep the line count under 1K?
  */
 
 #undef _POSIX_C_SOURCE
@@ -18,31 +16,32 @@
 #include <errno.h>
 #include <string.h>
 #include <stdarg.h>
+#include "assert.h"
 
 #include <getopt.h>
 
 #include "tbf_util.h"
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ < 199901L
-    #error "This program uses ISO C99. Get a better compiler."
+    #error "This program uses ISO C99. Upgrade to a better compiler."
 #endif
 
 #define INITIAL_TAPE_COUNT      32 * 1024
-#define INITIAL_STACK_COUNT     1 * 1024
-#define INITIAL_OP_COUNT        8 * 1024
+#define INITIAL_STACK_COUNT     1  * 1024
+#define INITIAL_OP_COUNT        8  * 1024
 
 /* *INDENT-OFF* */
 typedef enum {
-    BF_OK,
-    BF_OUT_OF_MEMORY,
     BF_UNBALANCED_LOOP,
     BF_LOOP_END_BEFORE_START,
     BF_CELL_VAL_OVERFLOW,
     BF_CELL_VAL_UNDERFLOW,
     BF_CELL_PTR_OVERFLOW,
     BF_CELL_PTR_UNDERFLOW,
+    BF_OUT_OF_MEMORY,
     BF_READ_FAILED,
     BF_WRITE_FAILED,
+    BF_OK,
 } Bf_Codes;
 
 static const char *const error_msgs[] = {
@@ -62,7 +61,7 @@ static const char *const error_msgs[] = {
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
     static_assert((sizeof error_msgs / sizeof error_msgs[0]) ==
-        BF_WRITE_FAILED + 1, "Bf_Codes and error_msgs must kept be in sync!");
+        BF_OK, "Bf_Codes and error_msgs must kept be in sync!");
 #endif
 
 typedef enum {
@@ -437,9 +436,9 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "}\n"
         "unsigned char chkd_mul(Ov_Behavior ov, unsigned char a, unsigned char b)\n"
         "{\n"
-        "    if (ov) {\n"
+        "    if (ov == BF_END_ERROR) {\n"
         "        if (a != 0 && b > UCHAR_MAX / a) {\n"
-        "            fprintf(stderr, \"Error: cell value overflow.\\n\");\n"
+        "            fprintf(stderr, \"Error: cell value overflowed.\\n\");\n"
         "            exit(EXIT_FAILURE);\n"
         "        }\n"
         "    }\n"
@@ -449,7 +448,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "{\n"
         "    if (ob == BF_END_ERROR) {\n"
         "        if (t->mem[t->head] < subtrahend) {\n"
-        "            fprintf(stderr, \"Error: cell value underflow.\\n\");\n"
+        "            fprintf(stderr, \"Error: cell value underflowed.\\n\");\n"
         "                exit(EXIT_FAILURE);\n"
         "        }\n"
         "    }\n"
@@ -460,7 +459,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "{\n"
         "    if (ob == BF_END_ERROR) {\n"
         "        if (t->mem[t->head] + addend < t->mem[t->head]) {\n"
-        "            fprintf(stderr, \"Error: cell value overflow.\\n\");\n"
+        "            fprintf(stderr, \"Error: cell value overflowed.\\n\");\n"
         "            exit(EXIT_FAILURE);\n"
         "        }\n"
         "    }\n"
@@ -471,7 +470,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "{\n"
         "    if (ob == BF_END_ERROR) {\n"
         "        if (t->head + addend < t->head) {\n"
-        "            fprintf(stderr, \"Error: cell pointer overflow.\\n\");\n"
+        "            fprintf(stderr, \"Error: cell pointer overflowed.\\n\");\n"
         "            exit(EXIT_FAILURE);\n"
         "        }\n"
         "    }\n"
@@ -483,7 +482,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
         "{\n"
         "    if (ob == BF_END_ERROR) {\n"
         "        if (t->head < subtrahend) {\n"
-        "            fprintf(stderr, \"Error: cell pointer underflow.\\n\");\n"
+        "            fprintf(stderr, \"Error: cell pointer u7nderflow.\\n\");\n"
         "            exit(EXIT_FAILURE);\n"
         "        }\n"
         "        t->head -= subtrahend;\n"
@@ -591,7 +590,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
 
             case OP_NEXT:
                 tbf_xfprintf(options->output,
-                    "   inc_cell_ptr(cell_ptr_ob, &t, %zu);\n", op.operand);
+                    "    inc_cell_ptr(cell_ptr_ob, &t, %zu);\n", op.operand);
                 ++ip;
                 break;
 
@@ -601,7 +600,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
                 ++ip;
                 break;
 
-            case OP_LOOP_START:{
+            case OP_LOOP_START: {
                 C_Op_Kind rv = 0;
 
                 if (rv = check_is_clear(ip, ops)) {
@@ -650,8 +649,7 @@ static Bf_Codes transpile(Ops ops[static 1], flags options[static 1])
                         options->output);
                     ++ip;
                 }
-            }
-                break;
+            } break;
 
             case OP_LOOP_END:
                 tbf_xfputs("    }\n", options->output);
@@ -733,6 +731,7 @@ static Bf_Codes interpret(Ops ops[static 1], flags options[static 1])
                 break;
 
             case OP_NEXT:
+                /* Check for patterns here. */
                 if ((options->cflag == BF_END_ERROR)
                     && (head + op.operand < head)) {
                     free(tape.items);
@@ -764,8 +763,58 @@ static Bf_Codes interpret(Ops ops[static 1], flags options[static 1])
                 break;
 
             case OP_LOOP_START:
-                ip = tape.items[head] == 0 ? op.operand : ip + 1;
-                break;
+                if (tape.items[head] != 0) {
+                    C_Op_Kind rv = 0;
+
+                    if (rv = check_is_clear(ip, ops)) {
+                        if (options->vflag == BF_END_ERROR) {
+                            free(tape.items);
+                            return BF_CELL_VAL_OVERFLOW;
+                        }
+                        tape.items[head] = 0;
+                        ip = op.operand;
+                    } else {
+                        ++ip;
+                    }
+                } else {
+                    ip = op.operand;
+                } break;
+
+                /* C_Op_Kind rv = 0; */
+
+                /* } else if (rv = check_is_add_or_mul(ip, ops)) { */
+                /*     if (rv == C_ADD_OR_MUL_TYPE1) { */
+                /*         tbf_xfprintf(options->output, */
+                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    inc_cell_val(cell_val_ob, &t, chkd_mul(cell_val_ob, %zu, t.mem[t.head + 1]));\n" */
+                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    t.mem[t.head] = 0;\n", */
+                /*             ops->items[ip + 2].operand); */
+
+                /*     } else { */
+                /*         tbf_xfprintf(options->output, */
+                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    inc_cell_val(cell_val_ob, &t, chkd_mul(cell_val_ob, %zu, t.mem[t.head - 1]));\n" */ 
+                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    t.mem[t.head] = 0;\n", */
+                /*             ops->items[ip + 2].operand); */
+                /*     } */
+                /*     ip = op.operand; */
+                /* } else if (rv = check_is_sub(ip, ops)) { */
+                /*     if (rv == C_SUB_TYPE1) { */
+                /*         tbf_xfprintf(options->output, */
+                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    dec_cell_val(cell_val_ob, &t, t.mem[t.head + 1]);\n" */
+                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    t.mem[t.head] = 0;\n"); */
+                /*     } else { */
+                /*         tbf_xfprintf(options->output, */
+                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    dec_cell_val(cell_val_ob, &t, t.mem[t.head - 1]);\n" */
+                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
+                /*             "    t.mem[t.head] = 0;\n"); */
+                /*     } */
+                /*     ip = op.operand; */
 
             case OP_LOOP_END:
                 ip = tape.items[head] != 0 ? op.operand : ip + 1;
@@ -970,6 +1019,8 @@ int main(int argc, char **argv)
 #endif
     rc = (options.tflag ? transpile : interpret) (&ops, &options);
 
+    printf("%d\n", rc);
+    printf("%d\n", BF_CELL_VAL_OVERFLOW);
     if (rc != BF_OK) {
         colored_fprintf(options.pflag, stderr, error_msgs[rc], in_fname);
     }
