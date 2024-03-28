@@ -1,8 +1,6 @@
 /*
- * LOC: 953. (*.c, *.h)
+ * LOC: 970. (*.c, *.h)
  *
- * TOD0: Replicate the transpiler's optimizations in the interpreter.
- *       Can we keep the line count under 1K?
  */
 
 #undef _POSIX_C_SOURCE
@@ -780,41 +778,8 @@ static Bf_Codes interpret(Ops ops[static 1], flags options[static 1])
                     ip = op.operand;
                 } break;
 
-                /* C_Op_Kind rv = 0; */
-
-                /* } else if (rv = check_is_add_or_mul(ip, ops)) { */
-                /*     if (rv == C_ADD_OR_MUL_TYPE1) { */
-                /*         tbf_xfprintf(options->output, */
-                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    inc_cell_val(cell_val_ob, &t, chkd_mul(cell_val_ob, %zu, t.mem[t.head + 1]));\n" */
-                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    t.mem[t.head] = 0;\n", */
-                /*             ops->items[ip + 2].operand); */
-
-                /*     } else { */
-                /*         tbf_xfprintf(options->output, */
-                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    inc_cell_val(cell_val_ob, &t, chkd_mul(cell_val_ob, %zu, t.mem[t.head - 1]));\n" */ 
-                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    t.mem[t.head] = 0;\n", */
-                /*             ops->items[ip + 2].operand); */
-                /*     } */
-                /*     ip = op.operand; */
-                /* } else if (rv = check_is_sub(ip, ops)) { */
-                /*     if (rv == C_SUB_TYPE1) { */
-                /*         tbf_xfprintf(options->output, */
-                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    dec_cell_val(cell_val_ob, &t, t.mem[t.head + 1]);\n" */
-                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    t.mem[t.head] = 0;\n"); */
-                /*     } else { */
-                /*         tbf_xfprintf(options->output, */
-                /*             "    inc_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    dec_cell_val(cell_val_ob, &t, t.mem[t.head - 1]);\n" */
-                /*             "    dec_cell_ptr(cell_ptr_ob, &t, 1);\n" */
-                /*             "    t.mem[t.head] = 0;\n"); */
-                /*     } */
-                /*     ip = op.operand; */
+                /* TODO: Replicate optimizations for add, mul, and sub like the
+                 * transpiler. */
 
             case OP_LOOP_END:
                 ip = tape.items[head] != 0 ? op.operand : ip + 1;
